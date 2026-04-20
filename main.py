@@ -30,10 +30,10 @@ try:
     import torch
     from fastai.vision.all import load_learner, PILImage
     from PIL import Image, UnidentifiedImageError
-    from torchvision import transforms as T
+    import numpy as np
 except ImportError:
     raise RuntimeError(
-        "Required ML packages are missing. Please install fastai, torch, and torchvision.")
+        "Required ML packages are missing. Please install fastai, torch, and numpy.")
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
@@ -81,13 +81,8 @@ last_prediction_vocab: list[str] = []
 last_inference_stage: str | None = None
 last_inference_error: str | None = None
 
-_MODEL_TRANSFORM = T.Compose(
-    [
-        T.Resize((MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), antialias=True),
-        T.ToTensor(),
-        T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-    ]
-)
+_MODEL_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+_MODEL_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
 
 
 def load_model() -> None:
@@ -187,10 +182,15 @@ def _predict_from_path(image_path: Path, learner=None):
 
     with Image.open(image_path) as raw_img:
         rgb_img = raw_img.convert("RGB")
-        inputs = _MODEL_TRANSFORM(rgb_img).unsqueeze(0)
+        resized = rgb_img.resize((MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), Image.Resampling.BILINEAR)
+        arr = np.asarray(resized, dtype=np.float32) / 255.0
+        inputs = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
 
     device = next(active_learn.model.parameters()).device
     inputs = inputs.to(device)
+    mean = _MODEL_MEAN.to(device)
+    std = _MODEL_STD.to(device)
+    inputs = (inputs - mean) / std
 
     vocab = [str(label).strip() for label in active_learn.dls.vocab]
     with active_learn.no_bar():
@@ -202,7 +202,8 @@ def _predict_from_path(image_path: Path, learner=None):
             if outputs.shape[-1] == 1:
                 positive_prob = torch.sigmoid(outputs)[0].flatten()
                 if len(vocab) >= 2:
-                    probabilities = torch.zeros(len(vocab), device=positive_prob.device)
+                    probabilities = torch.zeros(
+                        len(vocab), device=positive_prob.device)
                     probabilities[0] = 1 - positive_prob[0]
                     probabilities[1] = positive_prob[0]
                 else:
@@ -213,7 +214,8 @@ def _predict_from_path(image_path: Path, learner=None):
 
             if len(vocab) > 0 and probabilities.numel() != len(vocab):
                 if probabilities.numel() < len(vocab):
-                    padded = torch.zeros(len(vocab), device=probabilities.device)
+                    padded = torch.zeros(
+                        len(vocab), device=probabilities.device)
                     padded[:probabilities.numel()] = probabilities
                     probabilities = padded
                 else:
