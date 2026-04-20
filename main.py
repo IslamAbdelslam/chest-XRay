@@ -9,6 +9,7 @@ import shutil
 import os
 import warnings
 import asyncio
+import logging
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -32,6 +33,9 @@ except ImportError:
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+PREDICT_TIMEOUT_SECONDS = float(os.getenv("PREDICT_TIMEOUT_SECONDS", "25"))
+
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Pneumonia Detection API")
 
@@ -60,12 +64,35 @@ for p in possible_paths:
         model_path = p
         break
 
-if model_path is None:
-    raise FileNotFoundError("Could not find export.pkl.")
+learn = None
+model_load_error = None
 
-print(f"Loading model from: {model_path}")
-learn = load_learner(model_path)
-learn.model.eval()
+
+def load_model() -> None:
+    global learn, model_load_error
+
+    if learn is not None:
+        return
+
+    if model_path is None:
+        model_load_error = "Could not find export.pkl."
+        logger.error(model_load_error)
+        return
+
+    try:
+        logger.info("Loading model from: %s", model_path)
+        loaded = load_learner(model_path)
+        loaded.model.eval()
+        learn = loaded
+        model_load_error = None
+    except Exception as exc:
+        model_load_error = f"Model failed to load: {exc}"
+        logger.exception(model_load_error)
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    load_model()
 
 try:
     torch.set_num_threads(1)
@@ -93,11 +120,33 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "model_loaded": learn is not None,
+        "model_error": model_load_error,
+    }
+
+
+def _predict_from_path(image_path: Path):
+    # Run all model work in one sync function so it can be moved to a worker thread.
+    if learn is None:
+        raise RuntimeError(model_load_error or "Model is not loaded")
+
+    img = PILImage.create(image_path)
+    with learn.no_bar():
+        with torch.inference_mode():
+            return learn.predict(img)
 
 
 @app.post("/predict")
 async def predict(request: Request, file: UploadFile | None = File(default=None)):
+    load_model()
+    if learn is None:
+        raise HTTPException(
+            status_code=503,
+            detail=model_load_error or "Model is not available.",
+        )
+
     incoming_file: Any = file
     if incoming_file is None:
         form = await request.form()
@@ -143,12 +192,21 @@ async def predict(request: Request, file: UploadFile | None = File(default=None)
             raise HTTPException(
                 status_code=400, detail=f"Invalid image file: {e}")
 
-        img = PILImage.create(normalized_path)
         # FastAI progress bars can break in some hosted environments; disable per-call.
         async with predict_lock:
-            with learn.no_bar():
-                with torch.inference_mode():
-                    pred_label, _, probabilities = learn.predict(img)
+            try:
+                pred_label, _, probabilities = await asyncio.wait_for(
+                    asyncio.to_thread(_predict_from_path, normalized_path),
+                    timeout=PREDICT_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                raise HTTPException(
+                    status_code=504,
+                    detail=(
+                        "Prediction timed out. Try a smaller image or increase "
+                        "PREDICT_TIMEOUT_SECONDS."
+                    ),
+                )
 
         vocab = [str(label).strip() for label in learn.dls.vocab]
         class_probs = {
