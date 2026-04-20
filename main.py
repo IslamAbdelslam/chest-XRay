@@ -30,14 +30,16 @@ try:
     import torch
     from fastai.vision.all import load_learner, PILImage
     from PIL import Image, UnidentifiedImageError
+    from torchvision import transforms as T
 except ImportError:
     raise RuntimeError(
-        "FastAI is not installed. Please install fastai and torch.")
+        "Required ML packages are missing. Please install fastai, torch, and torchvision.")
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 PREDICT_TIMEOUT_SECONDS = float(os.getenv("PREDICT_TIMEOUT_SECONDS", "50"))
 MAX_IMAGE_DIM = int(os.getenv("MAX_IMAGE_DIM", "1024"))
+MODEL_IMAGE_SIZE = int(os.getenv("MODEL_IMAGE_SIZE", "224"))
 CONFIGURED_INFERENCE_START_METHOD = os.getenv("INFERENCE_START_METHOD")
 SAFE_INFERENCE_START_METHOD = os.getenv("SAFE_INFERENCE_START_METHOD", "spawn")
 INFERENCE_CRASH_THRESHOLD = int(os.getenv("INFERENCE_CRASH_THRESHOLD", "2"))
@@ -78,6 +80,14 @@ consecutive_inference_crashes = 0
 last_prediction_vocab: list[str] = []
 last_inference_stage: str | None = None
 last_inference_error: str | None = None
+
+_MODEL_TRANSFORM = T.Compose(
+    [
+        T.Resize((MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), antialias=True),
+        T.ToTensor(),
+        T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ]
+)
 
 
 def load_model() -> None:
@@ -142,6 +152,7 @@ async def diagnostics():
             "max_upload_mb": MAX_UPLOAD_MB,
             "predict_timeout_seconds": PREDICT_TIMEOUT_SECONDS,
             "max_image_dim": MAX_IMAGE_DIM,
+            "model_image_size": MODEL_IMAGE_SIZE,
             "configured_inference_start_method": CONFIGURED_INFERENCE_START_METHOD,
             "inference_start_method": active_inference_start_method,
             "safe_inference_start_method": SAFE_INFERENCE_START_METHOD,
@@ -174,12 +185,14 @@ def _predict_from_path(image_path: Path, learner=None):
     if active_learn is None:
         raise RuntimeError(model_load_error or "Model is not loaded")
 
-    img = PILImage.create(image_path)
-    dl = active_learn.dls.test_dl([img])
-    inputs = dl.one_batch()[0]
+    with Image.open(image_path) as raw_img:
+        rgb_img = raw_img.convert("RGB")
+        inputs = _MODEL_TRANSFORM(rgb_img).unsqueeze(0)
+
     device = next(active_learn.model.parameters()).device
-    if hasattr(inputs, "to"):
-        inputs = inputs.to(device)
+    inputs = inputs.to(device)
+
+    vocab = [str(label).strip() for label in active_learn.dls.vocab]
     with active_learn.no_bar():
         with torch.inference_mode():
             outputs = active_learn.model(inputs)
@@ -188,13 +201,25 @@ def _predict_from_path(image_path: Path, learner=None):
 
             if outputs.shape[-1] == 1:
                 positive_prob = torch.sigmoid(outputs)[0].flatten()
-                probabilities = torch.stack(
-                    [1 - positive_prob, positive_prob], dim=0).flatten()
+                if len(vocab) >= 2:
+                    probabilities = torch.zeros(len(vocab), device=positive_prob.device)
+                    probabilities[0] = 1 - positive_prob[0]
+                    probabilities[1] = positive_prob[0]
+                else:
+                    probabilities = torch.stack(
+                        [1 - positive_prob, positive_prob], dim=0).flatten()
             else:
                 probabilities = torch.softmax(outputs, dim=-1)[0]
 
+            if len(vocab) > 0 and probabilities.numel() != len(vocab):
+                if probabilities.numel() < len(vocab):
+                    padded = torch.zeros(len(vocab), device=probabilities.device)
+                    padded[:probabilities.numel()] = probabilities
+                    probabilities = padded
+                else:
+                    probabilities = probabilities[:len(vocab)]
+
             pred_index = int(torch.argmax(probabilities).item())
-            vocab = [str(label).strip() for label in active_learn.dls.vocab]
             pred_label = vocab[pred_index] if pred_index < len(
                 vocab) else str(pred_index)
             return pred_label, pred_index, probabilities, vocab
