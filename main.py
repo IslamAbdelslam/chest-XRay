@@ -191,7 +191,8 @@ def _predict_from_path(image_path: Path):
 class InferenceSubprocessCrash(RuntimeError):
     def __init__(self, exit_code: int | None):
         self.exit_code = exit_code
-        super().__init__(f"Inference subprocess crashed (exit code {exit_code}).")
+        super().__init__(
+            f"Inference subprocess crashed (exit code {exit_code}).")
 
 
 def _predict_subprocess_worker(image_path: str, model_path_str: str | None, conn) -> None:
@@ -199,7 +200,8 @@ def _predict_subprocess_worker(image_path: str, model_path_str: str | None, conn
         local_learn = learn
         if local_learn is None:
             if not model_path_str:
-                raise RuntimeError("Model path is missing in subprocess worker")
+                raise RuntimeError(
+                    "Model path is missing in subprocess worker")
             local_learn = load_learner(Path(model_path_str))
             local_learn.model.eval()
 
@@ -233,7 +235,8 @@ def _predict_via_subprocess(image_path: Path, timeout_seconds: float, start_meth
     parent_conn, child_conn = ctx.Pipe(duplex=False)
     proc = ctx.Process(
         target=_predict_subprocess_worker,
-        args=(str(image_path), str(model_path) if model_path is not None else None, child_conn),
+        args=(str(image_path), str(model_path)
+              if model_path is not None else None, child_conn),
         daemon=True,
     )
 
