@@ -10,6 +10,8 @@ import os
 import warnings
 import asyncio
 import logging
+import multiprocessing as mp
+import time
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -33,7 +35,11 @@ except ImportError:
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-PREDICT_TIMEOUT_SECONDS = float(os.getenv("PREDICT_TIMEOUT_SECONDS", "25"))
+PREDICT_TIMEOUT_SECONDS = float(os.getenv("PREDICT_TIMEOUT_SECONDS", "50"))
+MAX_IMAGE_DIM = int(os.getenv("MAX_IMAGE_DIM", "1024"))
+INFERENCE_START_METHOD = os.getenv("INFERENCE_START_METHOD", "fork")
+SAFE_INFERENCE_START_METHOD = os.getenv("SAFE_INFERENCE_START_METHOD", "spawn")
+INFERENCE_CRASH_THRESHOLD = int(os.getenv("INFERENCE_CRASH_THRESHOLD", "2"))
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -66,6 +72,8 @@ for p in possible_paths:
 
 learn = None
 model_load_error = None
+active_inference_start_method = INFERENCE_START_METHOD
+consecutive_inference_crashes = 0
 
 
 def load_model() -> None:
@@ -115,6 +123,8 @@ async def root():
         "predict": ["/predict"],
         "accepted_file_fields": ["file"],
         "max_upload_mb": MAX_UPLOAD_MB,
+        "predict_timeout_seconds": PREDICT_TIMEOUT_SECONDS,
+        "max_image_dim": MAX_IMAGE_DIM,
     }
 
 
@@ -127,6 +137,46 @@ async def health():
     }
 
 
+@app.get("/diag")
+async def diagnostics():
+    vocab = []
+    if learn is not None:
+        try:
+            vocab = [str(v) for v in learn.dls.vocab]
+        except Exception:
+            vocab = []
+
+    return {
+        "status": "ok",
+        "model_loaded": learn is not None,
+        "model_error": model_load_error,
+        "model_path": str(model_path) if model_path is not None else None,
+        "vocab": vocab,
+        "settings": {
+            "max_upload_mb": MAX_UPLOAD_MB,
+            "predict_timeout_seconds": PREDICT_TIMEOUT_SECONDS,
+            "max_image_dim": MAX_IMAGE_DIM,
+            "inference_start_method": active_inference_start_method,
+            "safe_inference_start_method": SAFE_INFERENCE_START_METHOD,
+            "inference_crash_threshold": INFERENCE_CRASH_THRESHOLD,
+            "consecutive_inference_crashes": consecutive_inference_crashes,
+        },
+        "runtime": {
+            "pythonunbuffered": os.getenv("PYTHONUNBUFFERED"),
+            "omp_num_threads": os.getenv("OMP_NUM_THREADS"),
+            "mkl_num_threads": os.getenv("MKL_NUM_THREADS"),
+            "openblas_num_threads": os.getenv("OPENBLAS_NUM_THREADS"),
+            "aten_cpu_capability": os.getenv("ATEN_CPU_CAPABILITY"),
+        },
+        "lock": {
+            "predict_lock_locked": predict_lock.locked(),
+        },
+        "versions": {
+            "torch": getattr(torch, "__version__", None),
+        },
+    }
+
+
 def _predict_from_path(image_path: Path):
     # Run all model work in one sync function so it can be moved to a worker thread.
     if learn is None:
@@ -136,6 +186,106 @@ def _predict_from_path(image_path: Path):
     with learn.no_bar():
         with torch.inference_mode():
             return learn.predict(img)
+
+
+class InferenceSubprocessCrash(RuntimeError):
+    def __init__(self, exit_code: int | None):
+        self.exit_code = exit_code
+        super().__init__(f"Inference subprocess crashed (exit code {exit_code}).")
+
+
+def _predict_subprocess_worker(image_path: str, model_path_str: str | None, conn) -> None:
+    try:
+        local_learn = learn
+        if local_learn is None:
+            if not model_path_str:
+                raise RuntimeError("Model path is missing in subprocess worker")
+            local_learn = load_learner(Path(model_path_str))
+            local_learn.model.eval()
+
+        try:
+            torch.set_num_threads(1)
+            torch.set_num_interop_threads(1)
+            torch.backends.mkldnn.enabled = False
+        except RuntimeError:
+            pass
+
+        img = PILImage.create(Path(image_path))
+        with local_learn.no_bar():
+            with torch.inference_mode():
+                pred_label, _, probabilities = local_learn.predict(img)
+
+        payload = {
+            "ok": True,
+            "pred_label": str(pred_label),
+            "probabilities": probabilities.tolist(),
+            "vocab": [str(label).strip() for label in local_learn.dls.vocab],
+        }
+        conn.send(payload)
+    except Exception as exc:
+        conn.send({"ok": False, "error": str(exc)})
+    finally:
+        conn.close()
+
+
+def _predict_via_subprocess(image_path: Path, timeout_seconds: float, start_method: str):
+    ctx = mp.get_context(start_method)
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_predict_subprocess_worker,
+        args=(str(image_path), str(model_path) if model_path is not None else None, child_conn),
+        daemon=True,
+    )
+
+    try:
+        proc.start()
+        child_conn.close()
+        deadline = time.monotonic() + timeout_seconds
+
+        while True:
+            if parent_conn.poll(0.2):
+                payload = parent_conn.recv()
+                proc.join(timeout=1)
+                if not payload.get("ok"):
+                    raise RuntimeError(payload.get(
+                        "error", "Unknown inference error"))
+                return payload
+
+            if not proc.is_alive():
+                raise InferenceSubprocessCrash(proc.exitcode)
+
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Inference subprocess timed out")
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=2)
+        parent_conn.close()
+
+
+def _record_inference_success() -> None:
+    global consecutive_inference_crashes
+    consecutive_inference_crashes = 0
+
+
+def _record_inference_crash() -> bool:
+    global consecutive_inference_crashes, active_inference_start_method
+    consecutive_inference_crashes += 1
+    should_switch = (
+        active_inference_start_method != SAFE_INFERENCE_START_METHOD
+        and consecutive_inference_crashes >= INFERENCE_CRASH_THRESHOLD
+    )
+    if should_switch:
+        logger.warning(
+            "Switching inference subprocess mode from %s to %s after %d consecutive crashes",
+            active_inference_start_method,
+            SAFE_INFERENCE_START_METHOD,
+            consecutive_inference_crashes,
+        )
+        active_inference_start_method = SAFE_INFERENCE_START_METHOD
+        consecutive_inference_crashes = 0
+        return True
+    return False
 
 
 @app.post("/predict")
@@ -185,8 +335,9 @@ async def predict(request: Request, file: UploadFile | None = File(default=None)
             with Image.open(tmp_path) as raw_img:
                 raw_img.load()
                 rgb_img = raw_img.convert("RGB")
-                if max(rgb_img.size) > 2048:
-                    rgb_img.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+                if max(rgb_img.size) > MAX_IMAGE_DIM:
+                    rgb_img.thumbnail(
+                        (MAX_IMAGE_DIM, MAX_IMAGE_DIM), Image.Resampling.LANCZOS)
                 rgb_img.save(normalized_path, format="JPEG", quality=95)
         except UnidentifiedImageError as e:
             raise HTTPException(
@@ -195,23 +346,35 @@ async def predict(request: Request, file: UploadFile | None = File(default=None)
         # FastAI progress bars can break in some hosted environments; disable per-call.
         async with predict_lock:
             try:
-                pred_label, _, probabilities = await asyncio.wait_for(
-                    asyncio.to_thread(_predict_from_path, normalized_path),
-                    timeout=PREDICT_TIMEOUT_SECONDS,
+                prediction = await asyncio.to_thread(
+                    _predict_via_subprocess,
+                    normalized_path,
+                    PREDICT_TIMEOUT_SECONDS,
+                    active_inference_start_method,
                 )
             except TimeoutError:
                 raise HTTPException(
                     status_code=504,
                     detail=(
-                        "Prediction timed out. Try a smaller image or increase "
-                        "PREDICT_TIMEOUT_SECONDS."
+                        "Prediction timed out before platform edge timeout. "
+                        "Try a smaller image or increase resources."
                     ),
                 )
+            except InferenceSubprocessCrash as exc:
+                switched = _record_inference_crash()
+                detail = f"Inference worker crashed (exit code {exc.exit_code})."
+                if switched:
+                    detail += " Automatically switched to safer inference mode; retry the request."
+                raise HTTPException(status_code=503, detail=detail)
 
-        vocab = [str(label).strip() for label in learn.dls.vocab]
+        _record_inference_success()
+
+        pred_label = prediction["pred_label"]
+        probabilities = prediction["probabilities"]
+        vocab = prediction["vocab"]
         class_probs = {
             class_name: float(prob)
-            for class_name, prob in zip(vocab, probabilities.tolist())
+            for class_name, prob in zip(vocab, probabilities)
         }
 
         def get_prob(*aliases: str) -> float:

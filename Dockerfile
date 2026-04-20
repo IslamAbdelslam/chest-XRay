@@ -15,10 +15,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Runtime limits to reduce CPU/RAM pressure on small instances
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONFAULTHANDLER=1 \
     OMP_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 \
+    PREDICT_TIMEOUT_SECONDS=50 \
+    MAX_IMAGE_DIM=1024 \
     MALLOC_ARENA_MAX=2 \
     ATEN_CPU_CAPABILITY=default \
     MKL_SERVICE_FORCE_INTEL=1
