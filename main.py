@@ -38,7 +38,7 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 PREDICT_TIMEOUT_SECONDS = float(os.getenv("PREDICT_TIMEOUT_SECONDS", "50"))
 MAX_IMAGE_DIM = int(os.getenv("MAX_IMAGE_DIM", "1024"))
-INFERENCE_START_METHOD = os.getenv("INFERENCE_START_METHOD", "spawn")
+CONFIGURED_INFERENCE_START_METHOD = os.getenv("INFERENCE_START_METHOD")
 SAFE_INFERENCE_START_METHOD = os.getenv("SAFE_INFERENCE_START_METHOD", "spawn")
 INFERENCE_CRASH_THRESHOLD = int(os.getenv("INFERENCE_CRASH_THRESHOLD", "2"))
 
@@ -73,7 +73,7 @@ for p in possible_paths:
 
 learn = None
 model_load_error = None
-active_inference_start_method = INFERENCE_START_METHOD
+active_inference_start_method = SAFE_INFERENCE_START_METHOD
 consecutive_inference_crashes = 0
 
 
@@ -157,6 +157,7 @@ async def diagnostics():
             "max_upload_mb": MAX_UPLOAD_MB,
             "predict_timeout_seconds": PREDICT_TIMEOUT_SECONDS,
             "max_image_dim": MAX_IMAGE_DIM,
+            "configured_inference_start_method": CONFIGURED_INFERENCE_START_METHOD,
             "inference_start_method": active_inference_start_method,
             "safe_inference_start_method": SAFE_INFERENCE_START_METHOD,
             "inference_crash_threshold": INFERENCE_CRASH_THRESHOLD,
@@ -270,7 +271,8 @@ def _predict_via_subprocess(image_path: Path, timeout_seconds: float, start_meth
                         f"Unexpected inference payload type: {type(payload).__name__}"
                     )
                 if not payload.get("ok"):
-                    error_type = payload.get("error_type") or "InferenceWorkerError"
+                    error_type = payload.get(
+                        "error_type") or "InferenceWorkerError"
                     error_message = (
                         payload.get("error_message")
                         or payload.get("error_repr")
@@ -278,7 +280,8 @@ def _predict_via_subprocess(image_path: Path, timeout_seconds: float, start_meth
                     )
                     traceback_text = payload.get("traceback")
                     if traceback_text:
-                        logger.error("Inference worker traceback:\n%s", traceback_text)
+                        logger.error(
+                            "Inference worker traceback:\n%s", traceback_text)
                     raise RuntimeError(f"{error_type}: {error_message}")
                 return payload
 
