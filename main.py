@@ -162,20 +162,21 @@ async def diagnostics():
     }
 
 
-def _predict_from_path(image_path: Path):
+def _predict_from_path(image_path: Path, learner=None):
     # Run all model work in one sync function so it can be moved to a worker thread.
-    if learn is None:
+    active_learn = learner or learn
+    if active_learn is None:
         raise RuntimeError(model_load_error or "Model is not loaded")
 
     img = PILImage.create(image_path)
-    dl = learn.dls.test_dl([img])
+    dl = active_learn.dls.test_dl([img])
     inputs = dl.one_batch()[0]
-    device = next(learn.model.parameters()).device
+    device = next(active_learn.model.parameters()).device
     if hasattr(inputs, "to"):
         inputs = inputs.to(device)
-    with learn.no_bar():
+    with active_learn.no_bar():
         with torch.inference_mode():
-            outputs = learn.model(inputs)
+            outputs = active_learn.model(inputs)
             if outputs.ndim == 1:
                 outputs = outputs.unsqueeze(0)
 
@@ -187,7 +188,7 @@ def _predict_from_path(image_path: Path):
                 probabilities = torch.softmax(outputs, dim=-1)[0]
 
             pred_index = int(torch.argmax(probabilities).item())
-            vocab = [str(label).strip() for label in learn.dls.vocab]
+            vocab = [str(label).strip() for label in active_learn.dls.vocab]
             pred_label = vocab[pred_index] if pred_index < len(
                 vocab) else str(pred_index)
             return pred_label, pred_index, probabilities, vocab
@@ -217,16 +218,16 @@ def _predict_subprocess_worker(image_path: str, model_path_str: str | None, conn
         except RuntimeError:
             pass
 
-        img = PILImage.create(Path(image_path))
-        with local_learn.no_bar():
-            with torch.inference_mode():
-                pred_label, _, probabilities = local_learn.predict(img)
+        pred_label, _, probabilities, vocab = _predict_from_path(
+            Path(image_path),
+            local_learn,
+        )
 
         payload = {
             "ok": True,
             "pred_label": str(pred_label),
             "probabilities": probabilities.tolist(),
-            "vocab": [str(label).strip() for label in local_learn.dls.vocab],
+            "vocab": vocab,
         }
         conn.send(payload)
     except Exception as exc:
