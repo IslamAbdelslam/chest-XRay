@@ -40,7 +40,7 @@ RUN pip install --no-cache-dir gdown
 COPY . .
 
 # Download model from Google Drive into the location expected by main.py
-RUN gdown --fuzzy "https://drive.google.com/file/d/1ppniUVWmgfNg_wnLFwx5YA-rk6mYQkMB/view?usp=sharing" -O /app/export.pkl
+RUN gdown 1ppniUVWmgfNg_wnLFwx5YA-rk6mYQkMB -O /app/export.pkl
 
 # Expose default app port
 EXPOSE 7860
