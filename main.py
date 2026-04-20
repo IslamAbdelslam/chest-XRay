@@ -76,6 +76,8 @@ model_load_error = None
 active_inference_start_method = SAFE_INFERENCE_START_METHOD
 consecutive_inference_crashes = 0
 last_prediction_vocab: list[str] = []
+last_inference_stage: str | None = None
+last_inference_error: str | None = None
 
 
 def load_model() -> None:
@@ -156,6 +158,10 @@ async def diagnostics():
         "lock": {
             "predict_lock_locked": predict_lock.locked(),
         },
+        "last_inference": {
+            "stage": last_inference_stage,
+            "error": last_inference_error,
+        },
         "versions": {
             "torch": getattr(torch, "__version__", None),
         },
@@ -203,6 +209,7 @@ class InferenceSubprocessCrash(RuntimeError):
 
 def _predict_subprocess_worker(image_path: str, model_path_str: str | None, conn) -> None:
     try:
+        conn.send({"status": "stage", "stage": "worker_started"})
         local_learn = learn
         if local_learn is None:
             if not model_path_str:
@@ -210,6 +217,7 @@ def _predict_subprocess_worker(image_path: str, model_path_str: str | None, conn
                     "Model path is missing in subprocess worker")
             local_learn = load_learner(Path(model_path_str))
             local_learn.model.eval()
+        conn.send({"status": "stage", "stage": "learner_loaded"})
 
         try:
             torch.set_num_threads(1)
@@ -218,10 +226,12 @@ def _predict_subprocess_worker(image_path: str, model_path_str: str | None, conn
         except RuntimeError:
             pass
 
+        conn.send({"status": "stage", "stage": "inference_preparing"})
         pred_label, _, probabilities, vocab = _predict_from_path(
             Path(image_path),
             local_learn,
         )
+        conn.send({"status": "stage", "stage": "inference_finished"})
 
         payload = {
             "ok": True,
@@ -245,6 +255,7 @@ def _predict_subprocess_worker(image_path: str, model_path_str: str | None, conn
 
 
 def _predict_via_subprocess(image_path: Path, timeout_seconds: float, start_method: str):
+    global last_inference_stage, last_inference_error
     ctx = mp.get_context(start_method)
     parent_conn, child_conn = ctx.Pipe(duplex=False)
     proc = ctx.Process(
@@ -265,6 +276,9 @@ def _predict_via_subprocess(image_path: Path, timeout_seconds: float, start_meth
                     payload = parent_conn.recv()
                 except EOFError:
                     if not proc.is_alive():
+                        last_inference_error = (
+                            f"Subprocess exited before returning a payload (exit code {proc.exitcode})."
+                        )
                         raise InferenceSubprocessCrash(proc.exitcode)
                     raise RuntimeError(
                         "Inference subprocess closed its pipe without returning a result."
@@ -274,6 +288,9 @@ def _predict_via_subprocess(image_path: Path, timeout_seconds: float, start_meth
                     raise RuntimeError(
                         f"Unexpected inference payload type: {type(payload).__name__}"
                     )
+                if payload.get("status") == "stage":
+                    last_inference_stage = str(payload.get("stage"))
+                    continue
                 if not payload.get("ok"):
                     error_type = payload.get(
                         "error_type") or "InferenceWorkerError"
@@ -286,10 +303,14 @@ def _predict_via_subprocess(image_path: Path, timeout_seconds: float, start_meth
                     if traceback_text:
                         logger.error(
                             "Inference worker traceback:\n%s", traceback_text)
+                    last_inference_error = f"{error_type}: {error_message}"
                     raise RuntimeError(f"{error_type}: {error_message}")
                 return payload
 
             if not proc.is_alive():
+                last_inference_error = (
+                    f"Subprocess exited before returning a payload (exit code {proc.exitcode})."
+                )
                 raise InferenceSubprocessCrash(proc.exitcode)
 
             if time.monotonic() >= deadline:
@@ -475,6 +496,8 @@ async def predict(request: Request, file: UploadFile | None = File(default=None)
     except Exception as e:
         print(f"[predict] error={type(e).__name__}: {e!r}", flush=True)
         error_message = str(e).strip() or repr(e)
+        global last_inference_error
+        last_inference_error = f"{type(e).__name__}: {error_message}"
         raise HTTPException(
             status_code=500,
             detail=f"Error predicting: {type(e).__name__}: {error_message}",
