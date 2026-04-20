@@ -12,6 +12,7 @@ import asyncio
 import logging
 import multiprocessing as mp
 import time
+import traceback
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -37,7 +38,7 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 PREDICT_TIMEOUT_SECONDS = float(os.getenv("PREDICT_TIMEOUT_SECONDS", "50"))
 MAX_IMAGE_DIM = int(os.getenv("MAX_IMAGE_DIM", "1024"))
-INFERENCE_START_METHOD = os.getenv("INFERENCE_START_METHOD", "fork")
+INFERENCE_START_METHOD = os.getenv("INFERENCE_START_METHOD", "spawn")
 SAFE_INFERENCE_START_METHOD = os.getenv("SAFE_INFERENCE_START_METHOD", "spawn")
 INFERENCE_CRASH_THRESHOLD = int(os.getenv("INFERENCE_CRASH_THRESHOLD", "2"))
 
@@ -225,7 +226,15 @@ def _predict_subprocess_worker(image_path: str, model_path_str: str | None, conn
         }
         conn.send(payload)
     except Exception as exc:
-        conn.send({"ok": False, "error": str(exc)})
+        conn.send(
+            {
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "error_repr": repr(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
     finally:
         conn.close()
 
@@ -247,11 +256,30 @@ def _predict_via_subprocess(image_path: Path, timeout_seconds: float, start_meth
 
         while True:
             if parent_conn.poll(0.2):
-                payload = parent_conn.recv()
+                try:
+                    payload = parent_conn.recv()
+                except EOFError:
+                    if not proc.is_alive():
+                        raise InferenceSubprocessCrash(proc.exitcode)
+                    raise RuntimeError(
+                        "Inference subprocess closed its pipe without returning a result."
+                    )
                 proc.join(timeout=1)
+                if not isinstance(payload, dict):
+                    raise RuntimeError(
+                        f"Unexpected inference payload type: {type(payload).__name__}"
+                    )
                 if not payload.get("ok"):
-                    raise RuntimeError(payload.get(
-                        "error", "Unknown inference error"))
+                    error_type = payload.get("error_type") or "InferenceWorkerError"
+                    error_message = (
+                        payload.get("error_message")
+                        or payload.get("error_repr")
+                        or "Unknown inference error"
+                    )
+                    traceback_text = payload.get("traceback")
+                    if traceback_text:
+                        logger.error("Inference worker traceback:\n%s", traceback_text)
+                    raise RuntimeError(f"{error_type}: {error_message}")
                 return payload
 
             if not proc.is_alive():
@@ -434,9 +462,12 @@ async def predict(request: Request, file: UploadFile | None = File(default=None)
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[predict] error={e}", flush=True)
+        print(f"[predict] error={type(e).__name__}: {e!r}", flush=True)
+        error_message = str(e).strip() or repr(e)
         raise HTTPException(
-            status_code=500, detail=f"Error predicting: {str(e)}")
+            status_code=500,
+            detail=f"Error predicting: {type(e).__name__}: {error_message}",
+        )
     finally:
         if normalized_path.exists():
             normalized_path.unlink()
