@@ -168,9 +168,29 @@ def _predict_from_path(image_path: Path):
         raise RuntimeError(model_load_error or "Model is not loaded")
 
     img = PILImage.create(image_path)
+    dl = learn.dls.test_dl([img])
+    inputs = dl.one_batch()[0]
+    device = next(learn.model.parameters()).device
+    if hasattr(inputs, "to"):
+        inputs = inputs.to(device)
     with learn.no_bar():
         with torch.inference_mode():
-            return learn.predict(img)
+            outputs = learn.model(inputs)
+            if outputs.ndim == 1:
+                outputs = outputs.unsqueeze(0)
+
+            if outputs.shape[-1] == 1:
+                positive_prob = torch.sigmoid(outputs)[0].flatten()
+                probabilities = torch.stack(
+                    [1 - positive_prob, positive_prob], dim=0).flatten()
+            else:
+                probabilities = torch.softmax(outputs, dim=-1)[0]
+
+            pred_index = int(torch.argmax(probabilities).item())
+            vocab = [str(label).strip() for label in learn.dls.vocab]
+            pred_label = vocab[pred_index] if pred_index < len(
+                vocab) else str(pred_index)
+            return pred_label, pred_index, probabilities, vocab
 
 
 class InferenceSubprocessCrash(RuntimeError):
