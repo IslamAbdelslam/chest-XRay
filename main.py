@@ -75,28 +75,18 @@ learn = None
 model_load_error = None
 active_inference_start_method = SAFE_INFERENCE_START_METHOD
 consecutive_inference_crashes = 0
+last_prediction_vocab: list[str] = []
 
 
 def load_model() -> None:
-    global learn, model_load_error
-
-    if learn is not None:
-        return
+    global model_load_error
 
     if model_path is None:
         model_load_error = "Could not find export.pkl."
         logger.error(model_load_error)
         return
 
-    try:
-        logger.info("Loading model from: %s", model_path)
-        loaded = load_learner(model_path)
-        loaded.model.eval()
-        learn = loaded
-        model_load_error = None
-    except Exception as exc:
-        model_load_error = f"Model failed to load: {exc}"
-        logger.exception(model_load_error)
+    model_load_error = None
 
 
 @app.on_event("startup")
@@ -133,26 +123,19 @@ async def root():
 async def health():
     return {
         "status": "ok",
-        "model_loaded": learn is not None,
+        "model_loaded": model_load_error is None,
         "model_error": model_load_error,
     }
 
 
 @app.get("/diag")
 async def diagnostics():
-    vocab = []
-    if learn is not None:
-        try:
-            vocab = [str(v) for v in learn.dls.vocab]
-        except Exception:
-            vocab = []
-
     return {
         "status": "ok",
-        "model_loaded": learn is not None,
+        "model_loaded": model_load_error is None,
         "model_error": model_load_error,
         "model_path": str(model_path) if model_path is not None else None,
-        "vocab": vocab,
+        "vocab": last_prediction_vocab,
         "settings": {
             "max_upload_mb": MAX_UPLOAD_MB,
             "predict_timeout_seconds": PREDICT_TIMEOUT_SECONDS,
@@ -325,7 +308,7 @@ def _record_inference_crash() -> bool:
 @app.post("/predict")
 async def predict(request: Request, file: UploadFile | None = File(default=None)):
     load_model()
-    if learn is None:
+    if model_load_error is not None:
         raise HTTPException(
             status_code=503,
             detail=model_load_error or "Model is not available.",
@@ -406,6 +389,8 @@ async def predict(request: Request, file: UploadFile | None = File(default=None)
         pred_label = prediction["pred_label"]
         probabilities = prediction["probabilities"]
         vocab = prediction["vocab"]
+        global last_prediction_vocab
+        last_prediction_vocab = vocab
         class_probs = {
             class_name: float(prob)
             for class_name, prob in zip(vocab, probabilities)
@@ -437,6 +422,8 @@ async def predict(request: Request, file: UploadFile | None = File(default=None)
                 "chest x-ray image",
                 "chest xray image",
                 "chest_xray",
+                "other",
+                "Other",
             )
             if chest_xray_prob > 0.0:
                 other_prob = max(0.0, 1.0 - chest_xray_prob)
